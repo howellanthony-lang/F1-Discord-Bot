@@ -1,6 +1,13 @@
 {
-  "last_runs": {},
+  "last_runs": {
+    "race_weekend_reminder": "2026-06-06T14:12:08.580926+00:00",
+    "schedule": "2026-06-06T14:12:08.565117+00:00",
+    "standings": "2026-06-06T14:12:08.433869+00:00"
+  },
   "sent": {
-    "news": {}
+    "news": {},
+    "race_weekend_reminder": {},
+    "schedule": {},
+    "standings": {}
   }
 }
