@@ -5,9 +5,11 @@
     "standings": "2026-06-06T14:12:08.433869+00:00"
   },
   "sent": {
+    "fastest_lap": {},
     "news": {},
     "race_weekend_reminder": {},
     "schedule": {},
+    "session_results": {},
     "standings": {}
   }
 }
