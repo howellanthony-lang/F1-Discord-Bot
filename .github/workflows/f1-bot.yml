@@ -1,0 +1,99 @@
+name: F1 Discord Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Automation mode"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - news
+          - standings
+          - schedule
+          - race-weekend
+          - all
+      force:
+        description: "Ignore duplicate and interval checks"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: f1-discord-automation
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Restore FastF1 cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: fastf1-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fastf1-cache-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate bot repo
+        run: python validate_bot.py
+
+      - name: Run F1 automation once
+        env:
+          BOT_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
+          FORCE_POST: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+          SCHEDULE_WEBHOOK: ${{ secrets.SCHEDULE_WEBHOOK }}
+          LIVE_TIMING_WEBHOOK: ${{ secrets.LIVE_TIMING_WEBHOOK }}
+          FASTEST_LAP_WEBHOOK: ${{ secrets.FASTEST_LAP_WEBHOOK }}
+          RACE_CONTROL_WEBHOOK: ${{ secrets.RACE_CONTROL_WEBHOOK }}
+          NEWS_WEBHOOK: ${{ secrets.NEWS_WEBHOOK }}
+          WEATHER_WEBHOOK: ${{ secrets.WEATHER_WEBHOOK }}
+          STANDINGS_WEBHOOK: ${{ secrets.STANDINGS_WEBHOOK }}
+          RESULTS_WEBHOOK: ${{ secrets.RESULTS_WEBHOOK }}
+          SEASON: ${{ vars.SEASON || '2026' }}
+          NEWS_LIMIT: ${{ vars.NEWS_LIMIT || '5' }}
+          STANDINGS_LIMIT: ${{ vars.STANDINGS_LIMIT || '10' }}
+        run: python f1_live_bot.py
+
+      - name: Commit dedupe state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/sent_items.json
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Update F1 bot sent-item state"
+            for attempt in 1 2 3; do
+              git push && break
+              echo "Push failed, rebasing and retrying..."
+              git pull --rebase
+              if [ "$attempt" = "3" ]; then
+                echo "Could not push state after 3 attempts."
+                exit 1
+              fi
+            done
+          fi
