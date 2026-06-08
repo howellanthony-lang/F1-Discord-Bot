@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__/
+*.pyc
+.env
+.venv/
+cache/
+config.py
+*.log
+dist/
+backup/
+*~
+*.swp
+*.swo
