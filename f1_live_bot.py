@@ -62,16 +62,21 @@ class BotConfig:
     standings_limit: int
     news_feeds: list[str]
     webhooks: dict[str, str]
+    weather_api_url: str
+    state_backend: str
+    gcs_state_bucket: str
+    gcs_state_blob: str
 
 
 def main() -> None:
     args = parse_args()
     bot_config = load_config()
-    state = load_state()
+    state = load_state(bot_config)
 
     print("Starting F1 Discord automation.")
     print(f"Mode: {args.mode}")
     print(f"Season: {bot_config.season}")
+    print(f"State backend: {bot_config.state_backend}")
     print(f"RaceControl reference: {RACE_CONTROL_REPO}")
 
     setup_fastf1_cache()
@@ -81,7 +86,7 @@ def main() -> None:
         run_task(task_name, task_func, bot_config, state, force=args.force)
 
     prune_state(state)
-    save_state(state)
+    save_state(bot_config, state)
     print("Finished. This run is complete.")
 
 
@@ -89,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the F1 Discord automation once.")
     parser.add_argument(
         "--mode",
-        choices=["auto", "news", "standings", "schedule", "race-weekend", "all"],
+        choices=["auto", "news", "standings", "schedule", "race-weekend", "weather", "all"],
         default=os.getenv("BOT_MODE", "auto"),
         help="Which automation group to run.",
     )
@@ -118,6 +123,13 @@ def load_config() -> BotConfig:
         standings_limit=int(os.getenv("STANDINGS_LIMIT", getattr(config, "STANDINGS_LIMIT", 10))),
         news_feeds=list(getattr(config, "NEWS_FEEDS", DEFAULT_NEWS_FEEDS) if config else DEFAULT_NEWS_FEEDS),
         webhooks=webhooks,
+        weather_api_url=os.getenv("WEATHER_API_URL", getattr(config, "WEATHER_API_URL", "") if config else ""),
+        state_backend=os.getenv("STATE_BACKEND", getattr(config, "STATE_BACKEND", "local") if config else "local"),
+        gcs_state_bucket=os.getenv("GCS_STATE_BUCKET", getattr(config, "GCS_STATE_BUCKET", "") if config else ""),
+        gcs_state_blob=os.getenv(
+            "GCS_STATE_BLOB",
+            getattr(config, "GCS_STATE_BLOB", "f1-discord-bot/sent_items.json") if config else "f1-discord-bot/sent_items.json",
+        ),
     )
 
 
@@ -135,13 +147,16 @@ def get_tasks_for_mode(mode: str) -> list[tuple[str, Callable[[BotConfig, dict[s
         ("race_weekend_reminder", post_race_weekend_reminder),
         ("session_results", post_latest_session_results),
         ("fastest_lap", post_fastest_lap),
+        ("weather", post_weather),
     ]
     if mode == "all":
         return all_tasks
     if mode == "auto":
         return all_tasks
     if mode == "race-weekend":
-        return all_tasks[3:]
+        return all_tasks[3:6]
+    if mode == "weather":
+        return [all_tasks[6]]
     if mode == "schedule":
         return [all_tasks[2], all_tasks[3]]
     if mode == "standings":
@@ -353,6 +368,64 @@ def post_fastest_lap(bot_config: BotConfig, state: dict[str, Any], force: bool) 
         record_sent(state, "fastest_lap", sent_id)
 
 
+def post_weather(bot_config: BotConfig, state: dict[str, Any], force: bool) -> None:
+    if not bot_config.weather_api_url:
+        print("Skipping weather: WEATHER_API_URL is not configured.")
+        return
+
+    if not is_due(state, "weather", hours=24, force=force):
+        print("Skipping weather: not due yet.")
+        return
+
+    weather = get_json(bot_config.weather_api_url)
+    sent_id = f"weather:{date_key(now_utc())}:{stable_hash(json.dumps(weather, sort_keys=True))}"
+    if was_sent(state, "weather", sent_id) and not force:
+        print("Skipping weather: already posted this forecast.")
+        mark_run(state, "weather")
+        return
+
+    if post_to_discord(bot_config, "weather", format_weather_message(weather), fallback="schedule"):
+        record_sent(state, "weather", sent_id)
+    mark_run(state, "weather")
+
+
+def format_weather_message(weather: dict[str, Any]) -> str:
+    lines = ["**F1 Weather Update**"]
+    location = weather.get("location") or weather.get("name")
+    if isinstance(location, dict):
+        location = location.get("name") or location.get("region") or location.get("country")
+    if location:
+        lines.append(f"Location: {clean_text(str(location))}")
+
+    current = weather.get("current") if isinstance(weather.get("current"), dict) else weather
+    temperature = first_present(current, ["temp_c", "temperature", "temperature_2m", "temp"])
+    condition = current.get("condition") if isinstance(current, dict) else None
+    if isinstance(condition, dict):
+        condition = condition.get("text")
+    wind = first_present(current, ["wind_kph", "wind_speed_10m", "wind_speed"])
+    rain = first_present(current, ["precip_mm", "precipitation", "rain"])
+
+    if temperature is not None:
+        lines.append(f"Temperature: {temperature}")
+    if condition:
+        lines.append(f"Conditions: {clean_text(str(condition))}")
+    if wind is not None:
+        lines.append(f"Wind: {wind}")
+    if rain is not None:
+        lines.append(f"Rain/precipitation: {rain}")
+
+    if len(lines) == 1:
+        lines.append(json.dumps(weather, indent=2, sort_keys=True)[:1500])
+    return "\n".join(lines)
+
+
+def first_present(data: dict[str, Any], keys: list[str]) -> Any | None:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
 def get_driver_standings_lines(bot_config: BotConfig) -> list[str]:
     data = get_json(f"{JOLPICA_BASE_URL}/{bot_config.season}/driverstandings/")
     standings = data["MRData"]["StandingsTable"]["StandingsLists"][0]["DriverStandings"]
@@ -479,7 +552,22 @@ def get_json(url: str) -> dict[str, Any]:
     return response.json()
 
 
-def load_state() -> dict[str, Any]:
+def load_state(bot_config: BotConfig) -> dict[str, Any]:
+    if should_use_gcs_state(bot_config):
+        try:
+            text = download_gcs_text(bot_config.gcs_state_bucket, bot_config.gcs_state_blob)
+            if not text:
+                print("Cloud Storage state is empty or missing; starting fresh.")
+                return {"sent": {}, "last_runs": {}}
+            state = json.loads(text)
+            state.setdefault("sent", {})
+            state.setdefault("last_runs", {})
+            print(f"Loaded state from gs://{bot_config.gcs_state_bucket}/{bot_config.gcs_state_blob}")
+            return state
+        except Exception as error:
+            print(f"Could not read Cloud Storage state; starting fresh: {error}")
+            return {"sent": {}, "last_runs": {}}
+
     if not STATE_FILE.exists():
         return {"sent": {}, "last_runs": {}}
     try:
@@ -493,12 +581,70 @@ def load_state() -> dict[str, Any]:
         return {"sent": {}, "last_runs": {}}
 
 
-def save_state(state: dict[str, Any]) -> None:
+def save_state(bot_config: BotConfig, state: dict[str, Any]) -> None:
+    if should_use_gcs_state(bot_config):
+        try:
+            latest_text = download_gcs_text(bot_config.gcs_state_bucket, bot_config.gcs_state_blob)
+            if latest_text:
+                state = merge_state(json.loads(latest_text), state)
+        except Exception as error:
+            print(f"Could not merge latest Cloud Storage state before save: {error}")
+        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        upload_gcs_text(bot_config.gcs_state_bucket, bot_config.gcs_state_blob, payload)
+        print(f"State saved: gs://{bot_config.gcs_state_bucket}/{bot_config.gcs_state_blob}")
+        return
+
     STATE_DIR.mkdir(exist_ok=True)
     with STATE_FILE.open("w", encoding="utf-8") as file:
         json.dump(state, file, indent=2, sort_keys=True)
         file.write("\n")
     print(f"State saved: {STATE_FILE}")
+
+
+def merge_state(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    base.setdefault("sent", {})
+    base.setdefault("last_runs", {})
+    overlay.setdefault("sent", {})
+    overlay.setdefault("last_runs", {})
+
+    for category, items in overlay["sent"].items():
+        base.setdefault("sent", {}).setdefault(category, {}).update(items)
+
+    for task_name, timestamp in overlay["last_runs"].items():
+        existing = base.setdefault("last_runs", {}).get(task_name)
+        if not existing or timestamp > existing:
+            base["last_runs"][task_name] = timestamp
+
+    return base
+
+
+def should_use_gcs_state(bot_config: BotConfig) -> bool:
+    backend = bot_config.state_backend.lower()
+    return backend in {"gcs", "cloud-storage", "cloud_storage"} or bool(bot_config.gcs_state_bucket)
+
+
+def get_storage_client() -> Any:
+    from google.cloud import storage
+
+    return storage.Client()
+
+
+def download_gcs_text(bucket_name: str, blob_name: str) -> str:
+    if not bucket_name:
+        raise ValueError("GCS_STATE_BUCKET is required when STATE_BACKEND=gcs.")
+    bucket = get_storage_client().bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    if not blob.exists():
+        return ""
+    return blob.download_as_text(encoding="utf-8")
+
+
+def upload_gcs_text(bucket_name: str, blob_name: str, text: str) -> None:
+    if not bucket_name:
+        raise ValueError("GCS_STATE_BUCKET is required when STATE_BACKEND=gcs.")
+    bucket = get_storage_client().bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(text, content_type="application/json")
 
 
 def is_due(
