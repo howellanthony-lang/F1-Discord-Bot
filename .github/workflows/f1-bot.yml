@@ -14,6 +14,7 @@ on:
           - standings
           - schedule
           - race-weekend
+          - weather
           - all
       force:
         description: "Ignore duplicate and interval checks"
