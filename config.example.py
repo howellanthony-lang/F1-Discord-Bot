@@ -15,3 +15,7 @@ NEWS_FEEDS = [
 SEASON = 2026
 NEWS_LIMIT = 5
 STANDINGS_LIMIT = 10
+WEATHER_API_URL = ""
+STATE_BACKEND = "local"
+GCS_STATE_BUCKET = ""
+GCS_STATE_BLOB = "f1-discord-bot/sent_items.json"
